@@ -107,10 +107,10 @@ This tool is invaluable for SOC analysts and threat hunters because it:
    - **Dashboard**: A responsive Streamlit interface with tabs for different analyses.
    - **Visualizations**: Interactive Plotly charts (heatmaps, graphs, histograms).
    - **Alerts**: Highlighted security findings with MITRE ATT&CK mappings.
-   - **Example Screenshot** (placeholder):
+   <!-- - **Example Screenshot** (placeholder):
      ```
      [Insert screenshot of dashboard showing packet list, network graph, and alerts]
-     ```
+     ``` -->
 
 ## Alert Types & Security Analysis
 The analyzer includes a robust set of detection rules mapped to MITRE ATT&CK tactics, designed to support SOC workflows:
