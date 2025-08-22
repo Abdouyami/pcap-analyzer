@@ -113,7 +113,6 @@ class PCAPAnalyzer:
                 packet_info['ttl'] = pkt[IP].ttl
                 packet_info['fragment_flags'] = str(pkt[IP].flags)
                 
-                # Calculate payload size (total - headers)
                 ip_header_len = pkt[IP].ihl * 4
                 packet_info['payload_size'] = len(pkt) - ip_header_len
                 
@@ -126,8 +125,6 @@ class PCAPAnalyzer:
                     packet_info['tcp_window'] = pkt[TCP].window
                     packet_info['tcp_seq'] = pkt[TCP].seq
                     packet_info['tcp_ack'] = pkt[TCP].ack
-                    
-                    # Further reduce payload size by TCP header
                     tcp_header_len = pkt[TCP].dataofs * 4
                     packet_info['payload_size'] -= tcp_header_len
                     
@@ -135,21 +132,30 @@ class PCAPAnalyzer:
                     packet_info['protocol'] = 'UDP'
                     packet_info['src_port'] = pkt[UDP].sport
                     packet_info['dst_port'] = pkt[UDP].dport
-                    packet_info['payload_size'] -= 8  # UDP header is 8 bytes
+                    packet_info['payload_size'] -= 8
+                    
+                    # Check for ISAKMP (port 500 or 4500)
+                    if pkt[UDP].dport in (500, 4500) or pkt[UDP].sport in (500, 4500):
+                        packet_info['protocol'] = 'ISAKMP'
+                        packet_info['info'] = f"ISAKMP packet (potential unparsed attributes: {pkt[UDP].payload})"
+                        # Skip further parsing to avoid warnings
+                        packet_data.append(packet_info)
+                        self._update_statistics(packet_info, pkt)
+                        continue
                     
                     # DNS parsing for tunneling detection
-                    if pkt[UDP].dport == 53 and DNS in pkt and pkt[DNS].qr == 0:  # DNS query
+                    if pkt[UDP].dport == 53 and DNS in pkt and pkt[DNS].qr == 0:
                         try:
                             domain = pkt[DNSQR].qname.decode('utf-8', errors='ignore')
                             self.dns_queries[packet_info['src_ip']].append(domain)
                         except:
                             pass
-                    
+                        
                 elif ICMP in pkt:
                     packet_info['protocol'] = 'ICMP'
                     packet_info['icmp_type'] = pkt[ICMP].type
                     packet_info['icmp_code'] = pkt[ICMP].code
-                    packet_info['payload_size'] -= 8  # ICMP header is typically 8 bytes
+                    packet_info['payload_size'] -= 8
                     
             elif ARP in pkt:
                 packet_info['protocol'] = 'ARP'
@@ -157,8 +163,6 @@ class PCAPAnalyzer:
                 packet_info['dst_ip'] = pkt[ARP].pdst
             
             packet_data.append(packet_info)
-            
-            # Update statistics
             self._update_statistics(packet_info, pkt)
         
         # Convert to DataFrame
@@ -166,9 +170,8 @@ class PCAPAnalyzer:
         if not self.packet_df.empty:
             self.packet_df['datetime'] = pd.to_datetime(self.packet_df['timestamp'], unit='s')
         
-        # Generate comprehensive analysis
         self._analyze_conversations()
-        self._detect_anomalies()  # New: ML-based anomaly detection
+        self._detect_anomalies()
         self._generate_alerts()
         self._analyze_performance_metrics()
     
