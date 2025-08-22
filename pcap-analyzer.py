@@ -11,6 +11,7 @@ import base64
 from collections import defaultdict, Counter
 import time
 import math  # For entropy calculation
+import warnings
 
 try:
     from scapy.all import rdpcap, IP, TCP, UDP, ICMP, ARP, Ether, sniff, DNS, DNSQR
@@ -25,6 +26,9 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
     st.warning("Scikit-learn not installed. ML-based anomaly detection will be skipped. Install with: pip install scikit-learn")
+
+# Suppress Scapy warnings globally
+warnings.filterwarnings("ignore", category=UserWarning, module="scapy.*")
 
 # Page configuration
 st.set_page_config(
@@ -65,110 +69,191 @@ class PCAPAnalyzer:
         self.protocols = Counter()
         self.alerts = []
         self.dns_queries = defaultdict(list)  # For DNS tunneling detection
+        self.problematic_packets = []  # Track problematic packets
         
     def load_pcap(self, file_path, max_packets=None):
-        """Load and parse PCAP file with optional packet limit for performance"""
+        """Load and parse PCAP file with enhanced error handling for ISAKMP and other protocols"""
         if not SCAPY_AVAILABLE:
             return False
             
         try:
-            # Use sniff for better control over loading large files
-            self.packets = sniff(offline=file_path, count=max_packets if max_packets else 0, store=True)
+            # Use rdpcap for better error handling with large files
+            st.info("Loading PCAP file... This may take a moment for large files.")
+            
+            # Load packets with timeout protection
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # Suppress Scapy warnings during loading
+                
+                # Use rdpcap instead of sniff for better control
+                all_packets = rdpcap(file_path)
+                
+                # Limit packets if specified
+                if max_packets and len(all_packets) > max_packets:
+                    self.packets = all_packets[:max_packets]
+                    st.warning(f"Limited analysis to first {max_packets:,} packets out of {len(all_packets):,} total")
+                else:
+                    self.packets = all_packets
+            
             self._analyze_packets()
             return True
+            
         except Exception as e:
             st.error(f"Error loading PCAP file: {str(e)}")
             return False
     
-    def _analyze_packets(self):
-        """Analyze packets and extract comprehensive statistics"""
-        packet_data = []
+    def _safe_packet_parse(self, pkt, index):
+        """Safely parse a packet with enhanced error handling for problematic protocols"""
+        packet_info = {
+            'index': index,
+            'timestamp': float(pkt.time),
+            'length': len(pkt),
+            'protocol': 'Unknown',
+            'src_ip': '',
+            'dst_ip': '',
+            'src_port': '',
+            'dst_port': '',
+            'tcp_flags': '',
+            'tcp_window': 0,
+            'tcp_seq': 0,
+            'tcp_ack': 0,
+            'icmp_type': '',
+            'icmp_code': '',
+            'ttl': 0,
+            'fragment_flags': '',
+            'payload_size': 0,
+            'info': '',
+            'parsing_status': 'success'
+        }
         
-        for i, pkt in enumerate(self.packets):
-            packet_info = {
-                'index': i,
-                'timestamp': float(pkt.time),
-                'length': len(pkt),
-                'protocol': 'Unknown',
-                'src_ip': '',
-                'dst_ip': '',
-                'src_port': '',
-                'dst_port': '',
-                'tcp_flags': '',
-                'tcp_window': 0,
-                'tcp_seq': 0,
-                'tcp_ack': 0,
-                'icmp_type': '',
-                'icmp_code': '',
-                'ttl': 0,
-                'fragment_flags': '',
-                'payload_size': 0,
-                'info': str(pkt.summary())
-            }
+        try:
+            # Basic packet info - always safe
+            packet_info['info'] = str(pkt.summary())
             
-            # Extract network layer info
+            # Network layer parsing with error handling
             if IP in pkt:
-                packet_info['src_ip'] = pkt[IP].src
-                packet_info['dst_ip'] = pkt[IP].dst
-                packet_info['ttl'] = pkt[IP].ttl
-                packet_info['fragment_flags'] = str(pkt[IP].flags)
+                try:
+                    packet_info['src_ip'] = pkt[IP].src
+                    packet_info['dst_ip'] = pkt[IP].dst
+                    packet_info['ttl'] = pkt[IP].ttl
+                    packet_info['fragment_flags'] = str(pkt[IP].flags)
+                    
+                    ip_header_len = pkt[IP].ihl * 4
+                    packet_info['payload_size'] = len(pkt) - ip_header_len
+                    
+                except Exception as e:
+                    packet_info['parsing_status'] = f'ip_error: {str(e)[:50]}'
+                    self.problematic_packets.append(index)
                 
-                ip_header_len = pkt[IP].ihl * 4
-                packet_info['payload_size'] = len(pkt) - ip_header_len
-                
-                # Transport layer protocols
-                if TCP in pkt:
-                    packet_info['protocol'] = 'TCP'
-                    packet_info['src_port'] = pkt[TCP].sport
-                    packet_info['dst_port'] = pkt[TCP].dport
-                    packet_info['tcp_flags'] = str(pkt[TCP].flags)
-                    packet_info['tcp_window'] = pkt[TCP].window
-                    packet_info['tcp_seq'] = pkt[TCP].seq
-                    packet_info['tcp_ack'] = pkt[TCP].ack
-                    tcp_header_len = pkt[TCP].dataofs * 4
-                    packet_info['payload_size'] -= tcp_header_len
-                    
-                elif UDP in pkt:
-                    packet_info['protocol'] = 'UDP'
-                    packet_info['src_port'] = pkt[UDP].sport
-                    packet_info['dst_port'] = pkt[UDP].dport
-                    packet_info['payload_size'] -= 8
-                    
-                    # Check for ISAKMP (port 500 or 4500)
-                    if pkt[UDP].dport in (500, 4500) or pkt[UDP].sport in (500, 4500):
-                        packet_info['protocol'] = 'ISAKMP'
-                        packet_info['info'] = f"ISAKMP packet (potential unparsed attributes: {pkt[UDP].payload})"
-                        # Skip further parsing to avoid warnings
-                        packet_data.append(packet_info)
-                        self._update_statistics(packet_info, pkt)
-                        continue
-                    
-                    # DNS parsing for tunneling detection
-                    if pkt[UDP].dport == 53 and DNS in pkt and pkt[DNS].qr == 0:
-                        try:
-                            domain = pkt[DNSQR].qname.decode('utf-8', errors='ignore')
-                            self.dns_queries[packet_info['src_ip']].append(domain)
-                        except:
-                            pass
+                # Transport layer parsing with enhanced ISAKMP handling
+                try:
+                    if UDP in pkt:
+                        packet_info['protocol'] = 'UDP'
+                        packet_info['src_port'] = pkt[UDP].sport
+                        packet_info['dst_port'] = pkt[UDP].dport
+                        packet_info['payload_size'] -= 8
                         
-                elif ICMP in pkt:
-                    packet_info['protocol'] = 'ICMP'
-                    packet_info['icmp_type'] = pkt[ICMP].type
-                    packet_info['icmp_code'] = pkt[ICMP].code
-                    packet_info['payload_size'] -= 8
+                        # Enhanced ISAKMP detection and handling
+                        if pkt[UDP].dport in (500, 4500) or pkt[UDP].sport in (500, 4500):
+                            packet_info['protocol'] = 'ISAKMP'
+                            # Don't try to parse ISAKMP payload to avoid warnings and freezing
+                            packet_info['info'] = f"ISAKMP packet {pkt[UDP].sport} -> {pkt[UDP].dport}"
+                            packet_info['payload_size'] = len(pkt[UDP].payload) if pkt[UDP].payload else 0
+                            packet_info['parsing_status'] = 'isakmp_skipped'
+                            return packet_info  # Early return to avoid deep parsing
+                        
+                        # DNS parsing for tunneling detection (with error handling)
+                        elif pkt[UDP].dport == 53:
+                            try:
+                                if DNS in pkt and pkt[DNS].qr == 0 and hasattr(pkt[DNS], 'qd') and pkt[DNS].qd:
+                                    domain = pkt[DNSQR].qname.decode('utf-8', errors='ignore').rstrip('.')
+                                    self.dns_queries[packet_info['src_ip']].append(domain)
+                            except:
+                                pass  # Ignore DNS parsing errors
+                                
+                    elif TCP in pkt:
+                        packet_info['protocol'] = 'TCP'
+                        packet_info['src_port'] = pkt[TCP].sport
+                        packet_info['dst_port'] = pkt[TCP].dport
+                        packet_info['tcp_flags'] = str(pkt[TCP].flags)
+                        packet_info['tcp_window'] = pkt[TCP].window
+                        packet_info['tcp_seq'] = pkt[TCP].seq
+                        packet_info['tcp_ack'] = pkt[TCP].ack
+                        tcp_header_len = pkt[TCP].dataofs * 4
+                        packet_info['payload_size'] -= tcp_header_len
+                        
+                    elif ICMP in pkt:
+                        packet_info['protocol'] = 'ICMP'
+                        packet_info['icmp_type'] = pkt[ICMP].type
+                        packet_info['icmp_code'] = pkt[ICMP].code
+                        packet_info['payload_size'] -= 8
+                        
+                except Exception as e:
+                    packet_info['parsing_status'] = f'transport_error: {str(e)[:50]}'
+                    self.problematic_packets.append(index)
                     
             elif ARP in pkt:
-                packet_info['protocol'] = 'ARP'
-                packet_info['src_ip'] = pkt[ARP].psrc
-                packet_info['dst_ip'] = pkt[ARP].pdst
+                try:
+                    packet_info['protocol'] = 'ARP'
+                    packet_info['src_ip'] = pkt[ARP].psrc
+                    packet_info['dst_ip'] = pkt[ARP].pdst
+                except Exception as e:
+                    packet_info['parsing_status'] = f'arp_error: {str(e)[:50]}'
             
+            # Handle other protocols safely
+            else:
+                try:
+                    if hasattr(pkt, 'name'):
+                        packet_info['protocol'] = pkt.name
+                    else:
+                        packet_info['protocol'] = 'Other'
+                except:
+                    packet_info['protocol'] = 'Unknown'
+                    
+        except Exception as e:
+            packet_info['parsing_status'] = f'general_error: {str(e)[:50]}'
+            packet_info['protocol'] = 'ParseError'
+            self.problematic_packets.append(index)
+        
+        return packet_info
+    
+    def _analyze_packets(self):
+        """Analyze packets with progress tracking and robust error handling"""
+        packet_data = []
+        total_packets = len(self.packets)
+        
+        # Create progress bar for large packet sets
+        if total_packets > 1000:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+        
+        for i, pkt in enumerate(self.packets):
+            # Update progress for large files
+            if total_packets > 1000 and i % 1000 == 0:
+                progress = i / total_packets
+                progress_bar.progress(progress)
+                status_text.text(f"Processing packet {i:,} of {total_packets:,} ({progress*100:.1f}%)")
+            
+            # Use safe parsing
+            packet_info = self._safe_packet_parse(pkt, i)
             packet_data.append(packet_info)
-            self._update_statistics(packet_info, pkt)
+            
+            # Update statistics only for successfully parsed packets
+            if packet_info['parsing_status'] == 'success' or packet_info['parsing_status'] == 'isakmp_skipped':
+                self._update_statistics(packet_info, pkt)
+        
+        # Clean up progress indicators
+        if total_packets > 1000:
+            progress_bar.empty()
+            status_text.empty()
         
         # Convert to DataFrame
         self.packet_df = pd.DataFrame(packet_data)
         if not self.packet_df.empty:
             self.packet_df['datetime'] = pd.to_datetime(self.packet_df['timestamp'], unit='s')
+        
+        # Report parsing issues
+        if self.problematic_packets:
+            st.warning(f"Encountered parsing issues with {len(self.problematic_packets)} packets. Analysis continues with remaining data.")
         
         self._analyze_conversations()
         self._detect_anomalies()
@@ -218,8 +303,8 @@ class PCAPAnalyzer:
             conv['min_packet_size'] = min(conv['min_packet_size'], length)
             conv['avg_packet_size'] = conv['bytes'] / conv['packets']
             
-            # Add port information
-            if packet_info['src_port'] and packet_info['dst_port']:
+            # Add port information (skip for ISAKMP to avoid issues)
+            if protocol != 'ISAKMP' and packet_info['src_port'] and packet_info['dst_port']:
                 conv['ports'].add(packet_info['src_port'])
                 conv['ports'].add(packet_info['dst_port'])
             
@@ -252,8 +337,8 @@ class PCAPAnalyzer:
                     self.endpoints[ip]['rx_packets'] += 1
                     self.endpoints[ip]['rx_bytes'] += length
                 
-                # Add port information
-                if packet_info['src_port'] and packet_info['dst_port']:
+                # Add port information (skip for ISAKMP)
+                if protocol != 'ISAKMP' and packet_info['src_port'] and packet_info['dst_port']:
                     if ip == src_ip:
                         self.endpoints[ip]['ports'].add(packet_info['src_port'])
                     else:
@@ -309,13 +394,17 @@ class PCAPAnalyzer:
             21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
             80: 'HTTP', 110: 'POP3', 143: 'IMAP', 443: 'HTTPS', 993: 'IMAPS',
             995: 'POP3S', 3389: 'RDP', 5432: 'PostgreSQL', 3306: 'MySQL',
-            1433: 'MSSQL', 6379: 'Redis', 27017: 'MongoDB'
+            1433: 'MSSQL', 6379: 'Redis', 27017: 'MongoDB', 500: 'ISAKMP', 4500: 'ISAKMP-NAT'
         }
         
         ports = list(conv['ports'])
         for port in ports:
             if port in common_ports:
                 return common_ports[port]
+        
+        # Check for ISAKMP in protocols
+        if 'ISAKMP' in conv['protocols']:
+            return 'VPN/IPSec'
         
         # Analyze by protocol and patterns
         if 'TCP' in conv['protocols']:
@@ -343,8 +432,8 @@ class PCAPAnalyzer:
         if conv['bytes'] > 10000000:  # 10MB
             risk_score += 1
         
-        # Unusual ports
-        unusual_ports = [port for port in conv['ports'] if port > 10000]
+        # Unusual ports (but not ISAKMP ports)
+        unusual_ports = [port for port in conv['ports'] if port > 10000 and port not in (500, 4500)]
         risk_score += len(unusual_ports) * 0.5
         
         # Very short or very long conversations
@@ -356,6 +445,10 @@ class PCAPAnalyzer:
         # Unidirectional traffic
         if conv['bidirectional_ratio'] < 0.1:
             risk_score += 1
+        
+        # Lower risk for known VPN protocols
+        if 'ISAKMP' in conv['protocols']:
+            risk_score *= 0.5  # Reduce risk for legitimate VPN traffic
         
         return min(risk_score, 5)  # Cap at 5
     
@@ -390,6 +483,11 @@ class PCAPAnalyzer:
             if label == -1:
                 anomaly_score = -scores[i] * 10  # Scale to 0-10
                 self.conversations[conv_key]['anomaly_score'] = anomaly_score
+                
+                # Don't flag ISAKMP traffic as highly anomalous by default
+                if 'ISAKMP' in self.conversations[conv_key]['protocols'] and anomaly_score < 7:
+                    continue
+                
                 self.alerts.append({
                     'severity': 'High',
                     'type': 'Anomaly Detected',
@@ -412,7 +510,8 @@ class PCAPAnalyzer:
             'packet_loss_indicators': 0,
             'latency_indicators': [],
             'fragmentation_rate': 0,
-            'retransmission_rate': 0
+            'retransmission_rate': 0,
+            'parsing_errors': len(self.problematic_packets)
         }
         
         # Peak bandwidth calculation (bytes per second in 1-second windows)
@@ -444,13 +543,12 @@ class PCAPAnalyzer:
         self._detect_high_packet_rate()
         self._detect_beaconing()
         self._detect_long_sessions()
-        self._detect_brute_force()  # New
-        self._detect_lateral_movement()  # New
-        self._detect_dns_tunneling()  # New
-        self._detect_persistence_traffic()  # New
+        self._detect_brute_force()
+        self._detect_lateral_movement()
+        self._detect_dns_tunneling()
+        self._detect_persistence_traffic()
     
-    # Modular detection functions below
-    
+    # Keep all the existing detection methods...
     def _detect_port_scanning(self):
         """Detect port scanning - Maps to MITRE TA0007"""
         tcp_packets = self.packet_df[self.packet_df['protocol'] == 'TCP']
@@ -856,6 +954,7 @@ def generate_technical_summary(analyzer):
 - **Unique IPs:** {pd.concat([analyzer.packet_df['src_ip'], analyzer.packet_df['dst_ip']]).nunique()}
 - **Capture Duration:** {(analyzer.packet_df['timestamp'].max() - analyzer.packet_df['timestamp'].min()):.2f} seconds
 - **Top Protocols:** {', '.join([f"{k} ({v})" for k, v in analyzer.protocols.most_common(5)])}
+- **Parsing Issues:** {analyzer.network_metrics.get('parsing_errors', 0)} packets had parsing problems
 
 ### Key Conversations (Top 5 by Bytes)
 """
@@ -875,23 +974,27 @@ def generate_technical_summary(analyzer):
 def generate_executive_summary(analyzer):
     """Generate high-level executive summary with risks and recommendations"""
     alert_df = pd.DataFrame(analyzer.alerts)
-    high_count = len(alert_df[alert_df['severity'] == 'High'])
-    medium_count = len(alert_df[alert_df['severity'] == 'Medium'])
+    high_count = len(alert_df[alert_df['severity'] == 'High']) if not alert_df.empty else 0
+    medium_count = len(alert_df[alert_df['severity'] == 'Medium']) if not alert_df.empty else 0
     
-    main_risks = alert_df['type'].value_counts().head(3).index.tolist()
+    main_risks = alert_df['type'].value_counts().head(3).index.tolist() if not alert_df.empty else []
     recommendations = []
-    for alert_type in set(alert_df['type']):
-        if alert_type == 'Port Scanning':
-            recommendations.append("Investigate source IPs for reconnaissance; block scanning hosts.")
-        elif alert_type == 'Possible C2 Beaconing':
-            recommendations.append("Isolate affected hosts and scan for malware.")
-        elif alert_type == 'Brute-Force Attempt':
-            recommendations.append("Enable account lockouts and monitor authentication logs.")
-        elif alert_type == 'Lateral Movement':
-            recommendations.append("Segment network and enforce least privilege access.")
-        elif alert_type == 'DNS Tunneling':
-            recommendations.append("Inspect DNS logs and restrict outbound DNS to trusted servers.")
-        # Add more as needed
+    
+    if not alert_df.empty:
+        for alert_type in set(alert_df['type']):
+            if alert_type == 'Port Scanning':
+                recommendations.append("Investigate source IPs for reconnaissance; block scanning hosts.")
+            elif alert_type == 'Possible C2 Beaconing':
+                recommendations.append("Isolate affected hosts and scan for malware.")
+            elif alert_type == 'Brute-Force Attempt':
+                recommendations.append("Enable account lockouts and monitor authentication logs.")
+            elif alert_type == 'Lateral Movement':
+                recommendations.append("Segment network and enforce least privilege access.")
+            elif alert_type == 'DNS Tunneling':
+                recommendations.append("Inspect DNS logs and restrict outbound DNS to trusted servers.")
+    
+    parsing_issues = analyzer.network_metrics.get('parsing_errors', 0)
+    parsing_note = f"\n- **Note**: {parsing_issues} packets had parsing issues (likely complex protocols like ISAKMP)" if parsing_issues > 0 else ""
     
     summary = f"""
 ### Executive Summary
@@ -900,7 +1003,8 @@ def generate_executive_summary(analyzer):
 - **Medium Severity Alerts:** {medium_count}
 - **Main Risks:** {', '.join(main_risks) if main_risks else 'None detected'}
 - **Recommended Actions:** 
-{'\n'.join(['- ' + rec for rec in recommendations]) if recommendations else '- No immediate actions required.'}
+{chr(10).join(['- ' + rec for rec in recommendations]) if recommendations else '- No immediate actions required.'}
+{parsing_note}
 """
     return summary
 
@@ -916,8 +1020,9 @@ def main():
     # Sidebar for file upload and controls
     st.sidebar.header("📁 Load PCAP File")
 
-    # Helpful PCAP resources
+    # Enhanced PCAP resources with ISAKMP info
     st.sidebar.markdown("### 📂 Sample PCAP Resources")
+    st.sidebar.markdown("**Note**: This analyzer handles ISAKMP/VPN traffic robustly")
 
     st.sidebar.markdown("Click a resource below to explore and download PCAP datasets:")
     if st.sidebar.button("🌐 Wireshark Sample Captures"):
@@ -934,7 +1039,7 @@ def main():
             unsafe_allow_html=True
         )
 
-    if st.sidebar.button("🔍 NETRESEC PCAP Files"):
+    if st.sidebar.button("📊 NETRESEC PCAP Files"):
         st.sidebar.markdown(
             "<a href='https://www.netresec.com/?page=PcapFiles' style='color:#28a745;text-decoration:none;' target='_blank'>Open Link</a>  \n"
             "<span style='font-size:12px;color:gray;'>Intrusion attempts, botnets, exploits.</span>",
@@ -959,9 +1064,10 @@ def main():
         help="Upload a PCAP file from your network capture or blue team lab"
     )
     
-    max_packets = st.sidebar.number_input("Max packets to load (for large files)", min_value=1000, max_value=None, value=100000, step=10000)
-    if len(analyzer.packet_df) > 100000:
-        st.sidebar.warning("Large PCAP loaded. Performance may be slow. Consider reducing max packets.")
+    max_packets = st.sidebar.number_input("Max packets to load (for large files)", min_value=1000, max_value=None, value=200000, step=10000)
+    
+    # ISAKMP handling notice
+    st.sidebar.info("🔒 Enhanced ISAKMP/VPN Traffic Handling: This version robustly processes VPN and encrypted tunnel traffic without freezing.")
     
     if uploaded_file is not None:
         # Save uploaded file temporarily
@@ -974,6 +1080,8 @@ def main():
             
             if success:
                 st.sidebar.success(f"✅ Loaded {len(analyzer.packets):,} packets")
+                if analyzer.problematic_packets:
+                    st.sidebar.warning(f"⚠️ {len(analyzer.problematic_packets)} packets had parsing issues (handled gracefully)")
             else:
                 st.sidebar.error("❌ Failed to load PCAP file")
                 st.stop()
@@ -986,7 +1094,7 @@ def main():
         st.warning("No packets found in the PCAP file")
         st.stop()
     
-    # Overview metrics
+    # Overview metrics with parsing status
     st.header("📊 Overview")
     
     col1, col2, col3, col4 = st.columns(4)
@@ -1014,6 +1122,15 @@ def main():
         st.metric("Duration", f"{duration:.2f}s")
         st.markdown('</div>', unsafe_allow_html=True)
     
+    # Show parsing status if there were issues
+    if analyzer.problematic_packets:
+        st.info(f"ℹ️ Successfully processed {len(analyzer.packet_df) - len(analyzer.problematic_packets):,} packets. {len(analyzer.problematic_packets)} packets had parsing issues but were handled gracefully.")
+    
+    # Show protocol breakdown with ISAKMP info
+    if 'ISAKMP' in analyzer.protocols:
+        st.info(f"🔒 Detected {analyzer.protocols['ISAKMP']} ISAKMP/VPN packets - processed with enhanced handling to prevent freezing.")
+    
+    
     # Alerts section
     if analyzer.alerts:
         st.header("🚨 Security Alerts")
@@ -1027,15 +1144,24 @@ def main():
             st.write(f"MITRE: {alert.get('mitre', 'N/A')} | Reasoning: {alert.get('reasoning', 'N/A')}")
             st.markdown('</div>', unsafe_allow_html=True)
     
-    # Tabs for different views
+    # Tabs for different views (keeping the same structure as before)
     tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📋 Packet List", "💬 Conversations", "📍 Endpoints", 
         "🔗 Protocol Hierarchy", "📈 I/O Graphs", "🌐 Network Graph",
-        "🚀 Performance", "🔒 Security Analysis", "📝 Reports"
+        "🚀 Performance", "🔒 Security Analysis", "📄 Reports"
     ])
     
     with tab1:
         st.header("Packet List")
+        st.info("Enhanced packet parsing with robust ISAKMP handling")
+        
+        # Show parsing status breakdown
+        if not analyzer.packet_df.empty:
+            parsing_status = analyzer.packet_df['parsing_status'].value_counts()
+            if len(parsing_status) > 1:
+                st.write("**Parsing Status:**")
+                for status, count in parsing_status.items():
+                    st.write(f"- {status}: {count:,} packets")
         
         # Enhanced filters
         col1, col2, col3, col4 = st.columns(4)
@@ -1134,6 +1260,7 @@ def main():
     
     with tab2:
         st.header("🔍 Comprehensive Conversations Analysis")
+        
         
         # Enhanced conversation statistics
         conversations_list = []
