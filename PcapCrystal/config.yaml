@@ -1,0 +1,99 @@
+# Enhanced PCAP Analyzer Configuration
+
+# Risk Scoring Engine Weights
+risk_scoring:
+  weights:
+    threat_intel_reputation: 0.3    # Threat intelligence reputation score
+    protocol_anomalies: 0.2         # Unusual protocol behavior
+    traffic_volume: 0.15            # Excessive traffic patterns
+    geographic_risk: 0.15           # Geographic threat indicators
+    port_scanning: 0.1              # Port scanning activities
+    timing_anomalies: 0.1           # Unusual timing patterns
+  
+  thresholds:
+    high_risk: 70      # Score >= 70 = High risk
+    medium_risk: 40    # Score >= 40 = Medium risk
+    low_risk: 20       # Score >= 20 = Low risk
+
+# Detection Rule Thresholds
+detections:
+  port_scanning:
+    unique_ports_threshold: 10      # Unique ports per source
+    unique_hosts_threshold: 5       # Unique destination hosts
+    time_window_seconds: 300        # Detection time window
+  
+  high_packet_rate:
+    packets_per_second: 1000        # Threshold for high packet rate
+    time_window_seconds: 60         # Evaluation window
+  
+  large_data_transfer:
+    bytes_threshold: 100000000      # 100MB threshold
+    session_duration_seconds: 300   # Minimum session duration
+  
+  c2_beaconing:
+    min_packets: 10                 # Minimum packets for analysis
+    variance_threshold: 0.3         # Timing variance threshold
+    interval_seconds: 60            # Expected beacon interval
+  
+  dns_tunneling:
+    entropy_threshold: 3.5          # Domain entropy threshold
+    length_threshold: 20            # Query length threshold
+    query_rate_threshold: 50        # Queries per minute
+
+# Geographic Risk Configuration
+geographic:
+  high_risk_countries:
+    - CN  # China
+    - RU  # Russia
+    - KP  # North Korea
+    - IR  # Iran
+  
+  suspicious_asns:
+    - 13335  # Example ASN (replace with actual suspicious ASNs)
+    - 16509  # Example ASN
+
+# Protocol Analysis Configuration
+protocols:
+  http:
+    suspicious_user_agents:
+      - "curl"
+      - "wget"
+      - "python-requests"
+    
+    suspicious_methods:
+      - "PUT"
+      - "DELETE"
+      - "PATCH"
+  
+  tls:
+    min_cert_validity_days: 30      # Minimum certificate validity
+    suspicious_cipher_suites:
+      - "TLS_NULL_WITH_NULL_NULL"
+  
+  dns:
+    max_query_length: 50            # Maximum normal query length
+    suspicious_record_types:
+      - "TXT"
+      - "NULL"
+
+# Caching Configuration
+cache:
+  threat_intel_ttl_hours: 24        # Threat intel cache TTL
+  geo_cache_ttl_hours: 168          # Geographic cache TTL (1 week)
+  max_cache_size_mb: 100            # Maximum cache size
+
+# API Rate Limiting
+rate_limits:
+  virustotal:
+    requests_per_minute: 4          # Free tier limit
+    daily_limit: 1000
+  
+  abuseipdb:
+    requests_per_minute: 60         # Free tier limit
+    daily_limit: 1000
+
+# Export Configuration
+export:
+  redact_pii: true                  # Redact PII in reports
+  include_raw_packets: false        # Include raw packet data
+  max_report_size_mb: 50            # Maximum report file size

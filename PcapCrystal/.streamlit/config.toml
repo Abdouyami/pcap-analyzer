@@ -1,0 +1,7 @@
+[server]
+headless = true
+address = "localhost"
+port = 6090
+
+[theme]
+base = "dark"
